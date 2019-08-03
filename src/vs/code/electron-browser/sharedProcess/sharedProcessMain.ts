@@ -13,10 +13,10 @@ import { SyncDescriptor } from 'vs/platform/instantiation/common/descriptors';
 import { InstantiationService } from 'vs/platform/instantiation/common/instantiationService';
 import { IEnvironmentService, ParsedArgs } from 'vs/platform/environment/common/environment';
 import { EnvironmentService } from 'vs/platform/environment/node/environmentService';
-import { ExtensionManagementChannel } from 'vs/platform/extensionManagement/node/extensionManagementIpc';
+import { ExtensionManagementChannel } from 'vs/platform/extensionManagement/common/extensionManagementIpc';
 import { IExtensionManagementService, IExtensionGalleryService } from 'vs/platform/extensionManagement/common/extensionManagement';
 import { ExtensionManagementService } from 'vs/platform/extensionManagement/node/extensionManagementService';
-import { ExtensionGalleryService } from 'vs/platform/extensionManagement/node/extensionGalleryService';
+import { ExtensionGalleryService } from 'vs/platform/extensionManagement/common/extensionGalleryService';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 import { ConfigurationService } from 'vs/platform/configuration/node/configurationService';
 import { IRequestService } from 'vs/platform/request/common/request';
@@ -37,8 +37,8 @@ import { ILocalizationsService } from 'vs/platform/localizations/common/localiza
 import { LocalizationsChannel } from 'vs/platform/localizations/node/localizationsIpc';
 import { DialogChannelClient } from 'vs/platform/dialogs/node/dialogIpc';
 import { IDialogService } from 'vs/platform/dialogs/common/dialogs';
-import { combinedDisposable, DisposableStore } from 'vs/base/common/lifecycle';
-import { DownloadService } from 'vs/platform/download/node/downloadService';
+import { combinedDisposable, DisposableStore, toDisposable } from 'vs/base/common/lifecycle';
+import { DownloadService } from 'vs/platform/download/common/downloadService';
 import { IDownloadService } from 'vs/platform/download/common/download';
 import { IChannel, IServerChannel, StaticRouter } from 'vs/base/parts/ipc/common/ipc';
 import { NodeCachedDataCleaner } from 'vs/code/electron-browser/sharedProcess/contrib/nodeCachedDataCleaner';
@@ -55,6 +55,8 @@ import { FileService } from 'vs/platform/files/common/fileService';
 import { IFileService } from 'vs/platform/files/common/files';
 import { DiskFileSystemProvider } from 'vs/platform/files/electron-browser/diskFileSystemProvider';
 import { Schemas } from 'vs/base/common/network';
+import { IProductService } from 'vs/platform/product/common/product';
+import { ProductService } from 'vs/platform/product/node/productService';
 
 export interface ISharedProcessConfiguration {
 	readonly machineId: string;
@@ -113,7 +115,7 @@ async function main(server: Server, initData: ISharedProcessInitData, configurat
 	services.set(ILogService, logService);
 	services.set(IConfigurationService, configurationService);
 	services.set(IRequestService, new SyncDescriptor(RequestService));
-	services.set(IDownloadService, new SyncDescriptor(DownloadService));
+	services.set(IProductService, new SyncDescriptor(ProductService));
 
 	const mainProcessService = new MainProcessService(server, mainRouter);
 	services.set(IMainProcessService, mainProcessService);
@@ -135,6 +137,8 @@ async function main(server: Server, initData: ISharedProcessInitData, configurat
 	disposables.add(diskFileSystemProvider);
 	fileService.registerProvider(Schemas.file, diskFileSystemProvider);
 
+	services.set(IDownloadService, new SyncDescriptor(DownloadService));
+
 	const instantiationService = new InstantiationService(services);
 
 	let telemetryService: ITelemetryService;
@@ -150,12 +154,12 @@ async function main(server: Server, initData: ISharedProcessInitData, configurat
 		if (!extensionDevelopmentLocationURI && !environmentService.args['disable-telemetry'] && product.enableTelemetry) {
 			if (product.aiConfig && product.aiConfig.asimovKey && isBuilt) {
 				appInsightsAppender = new AppInsightsAppender(eventPrefix, null, product.aiConfig.asimovKey, telemetryLogService);
-				disposables.add(appInsightsAppender); // Ensure the AI appender is disposed so that it flushes remaining data
+				disposables.add(toDisposable(() => appInsightsAppender!.flush())); // Ensure the AI appender is disposed so that it flushes remaining data
 			}
 			const config: ITelemetryServiceConfig = {
 				appender: combinedAppender(appInsightsAppender, new LogAppender(logService)),
 				commonProperties: resolveCommonProperties(product.commit, pkg.version, configuration.machineId, installSourcePath),
-				piiPaths: [appRoot, extensionsPath]
+				piiPaths: extensionsPath ? [appRoot, extensionsPath] : [appRoot]
 			};
 
 			telemetryService = new TelemetryService(config, configurationService);

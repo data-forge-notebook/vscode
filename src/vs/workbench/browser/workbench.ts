@@ -48,10 +48,10 @@ import { Layout } from 'vs/workbench/browser/layout';
 export class Workbench extends Layout {
 
 	private readonly _onShutdown = this._register(new Emitter<void>());
-	get onShutdown(): Event<void> { return this._onShutdown.event; }
+	readonly onShutdown: Event<void> = this._onShutdown.event;
 
 	private readonly _onWillShutdown = this._register(new Emitter<WillShutdownEvent>());
-	get onWillShutdown(): Event<WillShutdownEvent> { return this._onWillShutdown.event; }
+	readonly onWillShutdown: Event<WillShutdownEvent> = this._onWillShutdown.event;
 
 	constructor(
 		parent: HTMLElement,
@@ -79,11 +79,25 @@ export class Workbench extends Layout {
 		setUnexpectedErrorHandler(error => this.handleUnexpectedError(error, logService));
 
 		// Inform user about loading issues from the loader
+		interface AnnotatedLoadingError extends Error {
+			phase: 'loading';
+			moduleId: string;
+			neededBy: string[];
+		}
+		interface AnnotatedFactoryError extends Error {
+			phase: 'factory';
+			moduleId: string;
+		}
+		interface AnnotatedValidationError extends Error {
+			phase: 'configuration';
+		}
+		type AnnotatedError = AnnotatedLoadingError | AnnotatedFactoryError | AnnotatedValidationError;
 		(<any>window).require.config({
-			onError: (err: { errorCode: string; }) => {
-				if (err.errorCode === 'load') {
+			onError: (err: AnnotatedError) => {
+				if (err.phase === 'loading') {
 					onUnexpectedError(new Error(localize('loaderErrorNative', "Failed to load a required file. Please restart the application to try again. Details: {0}", JSON.stringify(err))));
 				}
+				console.error(err);
 			}
 		});
 	}

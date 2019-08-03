@@ -47,6 +47,7 @@ export interface ParsedArgs {
 	'disable-extension'?: string | string[];
 	'list-extensions'?: boolean;
 	'show-versions'?: boolean;
+	'category'?: string;
 	'install-extension'?: string | string[];
 	'uninstall-extension'?: string | string[];
 	'locate-extension'?: string | string[];
@@ -132,7 +133,7 @@ export interface IEnvironmentService {
 	isExtensionDevelopment: boolean;
 	disableExtensions: boolean | string[];
 	builtinExtensionsPath: string;
-	extensionsPath: string;
+	extensionsPath?: string;
 	extensionDevelopmentLocationURI?: URI[];
 	extensionTestsLocationURI?: URI;
 
@@ -170,4 +171,6 @@ export interface IEnvironmentService {
 	webviewEndpoint?: string;
 	readonly webviewResourceRoot: string;
 	readonly webviewCspSource: string;
+
+	readonly galleryMachineIdResource?: URI;
 }

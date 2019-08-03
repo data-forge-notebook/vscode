@@ -222,10 +222,10 @@ export class TerminalTab extends Disposable implements ITerminalTab {
 
 	public get terminalInstances(): ITerminalInstance[] { return this._terminalInstances; }
 
-	private readonly _onDisposed: Emitter<ITerminalTab>;
-	public get onDisposed(): Event<ITerminalTab> { return this._onDisposed.event; }
-	private readonly _onInstancesChanged: Emitter<void>;
-	public get onInstancesChanged(): Event<void> { return this._onInstancesChanged.event; }
+	private readonly _onDisposed: Emitter<ITerminalTab> = new Emitter<ITerminalTab>();
+	public readonly onDisposed: Event<ITerminalTab> = this._onDisposed.event;
+	private readonly _onInstancesChanged: Emitter<void> = new Emitter<void>();
+	public readonly onInstancesChanged: Event<void> = this._onInstancesChanged.event;
 
 	constructor(
 		terminalFocusContextKey: IContextKey<boolean>,
@@ -237,8 +237,6 @@ export class TerminalTab extends Disposable implements ITerminalTab {
 		@IInstantiationService private readonly _instantiationService: IInstantiationService
 	) {
 		super();
-		this._onDisposed = new Emitter<ITerminalTab>();
-		this._onInstancesChanged = new Emitter<void>();
 
 		let instance: ITerminalInstance;
 		if ('id' in shellLaunchConfigOrInstance) {
@@ -248,8 +246,7 @@ export class TerminalTab extends Disposable implements ITerminalTab {
 				terminalFocusContextKey,
 				configHelper,
 				undefined,
-				shellLaunchConfigOrInstance,
-				true);
+				shellLaunchConfigOrInstance);
 		}
 		this._terminalInstances.push(instance);
 		this._initInstanceListeners(instance);
@@ -391,8 +388,7 @@ export class TerminalTab extends Disposable implements ITerminalTab {
 			terminalFocusContextKey,
 			configHelper,
 			undefined,
-			shellLaunchConfig,
-			true);
+			shellLaunchConfig);
 		this._terminalInstances.splice(this._activeInstanceIndex + 1, 0, instance);
 		this._initInstanceListeners(instance);
 		this._setActiveInstance(instance);
