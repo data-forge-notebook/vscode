@@ -3,18 +3,17 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { KeyCode, KeyMod } from 'vs/base/common/keyCodes';
-import { isMacintosh } from 'vs/base/common/platform';
+import { MultiCommand, RedoCommand, SelectAllCommand, UndoCommand } from 'vs/editor/browser/editorExtensions';
+import { CopyAction, CutAction, PasteAction } from 'vs/editor/contrib/clipboard/clipboard';
 import { SyncActionDescriptor } from 'vs/platform/actions/common/actions';
-import { ContextKeyExpr } from 'vs/platform/contextkey/common/contextkey';
-import { InputFocusedContextKey } from 'vs/platform/contextkey/common/contextkeys';
 import { registerSingleton } from 'vs/platform/instantiation/common/extensions';
-import { KeybindingWeight } from 'vs/platform/keybinding/common/keybindingsRegistry';
+import { ServicesAccessor } from 'vs/platform/instantiation/common/instantiation';
 import { Registry } from 'vs/platform/registry/common/platform';
 import { Extensions as ActionExtensions, IWorkbenchActionRegistry } from 'vs/workbench/common/actions';
-import { WebviewEditor } from 'vs/workbench/contrib/webview/browser/webviewEditor';
-import { IWebviewService, webviewDeveloperCategory } from 'vs/workbench/contrib/webview/common/webview';
+import { IWebviewService, webviewDeveloperCategory, WebviewOverlay } from 'vs/workbench/contrib/webview/browser/webview';
+import { getActiveWebview } from 'vs/workbench/contrib/webview/browser/webviewCommands';
 import * as webviewCommands from 'vs/workbench/contrib/webview/electron-browser/webviewCommands';
+import { ElectronWebviewBasedWebview } from 'vs/workbench/contrib/webview/electron-browser/webviewElement';
 import { ElectronWebviewService } from 'vs/workbench/contrib/webview/electron-browser/webviewService';
 
 registerSingleton(IWebviewService, ElectronWebviewService, true);
@@ -22,71 +21,49 @@ registerSingleton(IWebviewService, ElectronWebviewService, true);
 const actionRegistry = Registry.as<IWorkbenchActionRegistry>(ActionExtensions.WorkbenchActions);
 
 actionRegistry.registerWorkbenchAction(
-	new SyncActionDescriptor(webviewCommands.OpenWebviewDeveloperToolsAction, webviewCommands.OpenWebviewDeveloperToolsAction.ID, webviewCommands.OpenWebviewDeveloperToolsAction.LABEL),
+	SyncActionDescriptor.from(webviewCommands.OpenWebviewDeveloperToolsAction),
 	webviewCommands.OpenWebviewDeveloperToolsAction.ALIAS,
 	webviewDeveloperCategory);
 
-function registerWebViewCommands(editorId: string): void {
-	const contextKeyExpr = ContextKeyExpr.and(ContextKeyExpr.equals('activeEditor', editorId), ContextKeyExpr.not('editorFocus') /* https://github.com/Microsoft/vscode/issues/58668 */);
-
-	(new webviewCommands.SelectAllWebviewEditorCommand({
-		id: webviewCommands.SelectAllWebviewEditorCommand.ID,
-		precondition: ContextKeyExpr.and(contextKeyExpr, ContextKeyExpr.not(InputFocusedContextKey)),
-		kbOpts: {
-			primary: KeyMod.CtrlCmd | KeyCode.KEY_A,
-			weight: KeybindingWeight.EditorContrib
-		}
-	})).register();
-
-	// These commands are only needed on MacOS where we have to disable the menu bar commands
-	if (isMacintosh) {
-		(new webviewCommands.CopyWebviewEditorCommand({
-			id: webviewCommands.CopyWebviewEditorCommand.ID,
-			precondition: ContextKeyExpr.and(contextKeyExpr, ContextKeyExpr.not(InputFocusedContextKey)),
-			kbOpts: {
-				primary: KeyMod.CtrlCmd | KeyCode.KEY_C,
-				weight: KeybindingWeight.EditorContrib
-			}
-		})).register();
-
-		(new webviewCommands.PasteWebviewEditorCommand({
-			id: webviewCommands.PasteWebviewEditorCommand.ID,
-			precondition: ContextKeyExpr.and(contextKeyExpr, ContextKeyExpr.not(InputFocusedContextKey)),
-			kbOpts: {
-				primary: KeyMod.CtrlCmd | KeyCode.KEY_V,
-				weight: KeybindingWeight.EditorContrib
-			}
-		})).register();
-
-		(new webviewCommands.CutWebviewEditorCommand({
-			id: webviewCommands.CutWebviewEditorCommand.ID,
-			precondition: ContextKeyExpr.and(contextKeyExpr, ContextKeyExpr.not(InputFocusedContextKey)),
-			kbOpts: {
-				primary: KeyMod.CtrlCmd | KeyCode.KEY_X,
-				weight: KeybindingWeight.EditorContrib
-			}
-		})).register();
-
-		(new webviewCommands.UndoWebviewEditorCommand({
-			id: webviewCommands.UndoWebviewEditorCommand.ID,
-			precondition: ContextKeyExpr.and(contextKeyExpr, ContextKeyExpr.not(InputFocusedContextKey)),
-			kbOpts: {
-				primary: KeyMod.CtrlCmd | KeyCode.KEY_Z,
-				weight: KeybindingWeight.EditorContrib
-			}
-		})).register();
-
-		(new webviewCommands.RedoWebviewEditorCommand({
-			id: webviewCommands.RedoWebviewEditorCommand.ID,
-			precondition: ContextKeyExpr.and(contextKeyExpr, ContextKeyExpr.not(InputFocusedContextKey)),
-			kbOpts: {
-				primary: KeyMod.CtrlCmd | KeyCode.KEY_Y,
-				secondary: [KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KEY_Z],
-				mac: { primary: KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KEY_Z },
-				weight: KeybindingWeight.EditorContrib
-			}
-		})).register();
+function getActiveElectronBasedWebview(accessor: ServicesAccessor): ElectronWebviewBasedWebview | undefined {
+	const webview = getActiveWebview(accessor);
+	if (!webview) {
+		return undefined;
 	}
+
+	// Make sure we are really focused on the webview
+	if (!['WEBVIEW', 'IFRAME'].includes(document.activeElement?.tagName ?? '')) {
+		return undefined;
+	}
+
+	if (webview instanceof ElectronWebviewBasedWebview) {
+		return webview;
+	} else if ('getInnerWebview' in (webview as WebviewOverlay)) {
+		const innerWebview = (webview as WebviewOverlay).getInnerWebview();
+		if (innerWebview instanceof ElectronWebviewBasedWebview) {
+			return innerWebview;
+		}
+	}
+
+	return undefined;
 }
 
-registerWebViewCommands(WebviewEditor.ID);
+const PRIORITY = 100;
+
+function overrideCommandForWebview(command: MultiCommand | undefined, f: (webview: ElectronWebviewBasedWebview) => void) {
+	command?.addImplementation(PRIORITY, accessor => {
+		const webview = getActiveElectronBasedWebview(accessor);
+		if (webview) {
+			f(webview);
+			return true;
+		}
+		return false;
+	});
+}
+
+overrideCommandForWebview(UndoCommand, webview => webview.undo());
+overrideCommandForWebview(RedoCommand, webview => webview.redo());
+overrideCommandForWebview(SelectAllCommand, webview => webview.selectAll());
+overrideCommandForWebview(CopyAction, webview => webview.copy());
+overrideCommandForWebview(PasteAction, webview => webview.paste());
+overrideCommandForWebview(CutAction, webview => webview.cut());

@@ -4,22 +4,20 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import * as Proto from '../protocol';
+import type * as Proto from '../protocol';
 import { ITypeScriptServiceClient } from '../typescriptService';
 import API from '../utils/api';
-import { isTypeScriptDocument } from '../utils/languageModeIds';
-import { ResourceMap } from '../utils/resourceMap';
 import { Disposable } from '../utils/dispose';
+import * as fileSchemes from '../utils/fileSchemes';
+import { isTypeScriptDocument } from '../utils/languageModeIds';
+import { equals } from '../utils/objects';
+import { ResourceMap } from '../utils/resourceMap';
 
-
-function objsAreEqual<T>(a: T, b: T): boolean {
-	let keys = Object.keys(a);
-	for (const key of keys) {
-		if ((a as any)[key] !== (b as any)[key]) {
-			return false;
-		}
+namespace Experimental {
+	// https://github.com/microsoft/TypeScript/pull/37871/
+	export interface UserPreferences extends Proto.UserPreferences {
+		readonly provideRefactorNotApplicableReason?: boolean;
 	}
-	return true;
 }
 
 interface FileConfiguration {
@@ -28,10 +26,7 @@ interface FileConfiguration {
 }
 
 function areFileConfigurationsEqual(a: FileConfiguration, b: FileConfiguration): boolean {
-	return (
-		objsAreEqual(a.formatOptions, b.formatOptions)
-		&& objsAreEqual(a.preferences, b.preferences)
-	);
+	return equals(a, b);
 }
 
 export default class FileConfigurationManager extends Disposable {
@@ -165,6 +160,7 @@ export default class FileConfigurationManager extends Disposable {
 			insertSpaceAfterTypeAssertion: config.get<boolean>('insertSpaceAfterTypeAssertion'),
 			placeOpenBraceOnNewLineForFunctions: config.get<boolean>('placeOpenBraceOnNewLineForFunctions'),
 			placeOpenBraceOnNewLineForControlBlocks: config.get<boolean>('placeOpenBraceOnNewLineForControlBlocks'),
+			semicolons: config.get<Proto.SemicolonPreference>('semicolons'),
 		};
 	}
 
@@ -174,16 +170,25 @@ export default class FileConfigurationManager extends Disposable {
 		}
 
 		const config = vscode.workspace.getConfiguration(
+			isTypeScriptDocument(document) ? 'typescript' : 'javascript',
+			document.uri);
+
+		const preferencesConfig = vscode.workspace.getConfiguration(
 			isTypeScriptDocument(document) ? 'typescript.preferences' : 'javascript.preferences',
 			document.uri);
 
-		return {
-			quotePreference: this.getQuoteStylePreference(config),
-			importModuleSpecifierPreference: getImportModuleSpecifierPreference(config),
-			allowTextChangesInNewFiles: document.uri.scheme === 'file',
-			providePrefixAndSuffixTextForRename: config.get<boolean>('renameShorthandProperties', true),
+		const preferences: Experimental.UserPreferences = {
+			quotePreference: this.getQuoteStylePreference(preferencesConfig),
+			importModuleSpecifierPreference: getImportModuleSpecifierPreference(preferencesConfig),
+			importModuleSpecifierEnding: getImportModuleSpecifierEndingPreference(preferencesConfig),
+			allowTextChangesInNewFiles: document.uri.scheme === fileSchemes.file,
+			providePrefixAndSuffixTextForRename: preferencesConfig.get<boolean>('renameShorthandProperties', true) === false ? false : preferencesConfig.get<boolean>('useAliasesForRenames', true),
 			allowRenameOfImportPath: true,
+			includeAutomaticOptionalChainCompletions: config.get<boolean>('suggest.includeAutomaticOptionalChainCompletions', true),
+			provideRefactorNotApplicableReason: true,
 		};
+
+		return preferences;
 	}
 
 	private getQuoteStylePreference(config: vscode.WorkspaceConfiguration) {
@@ -200,5 +205,14 @@ function getImportModuleSpecifierPreference(config: vscode.WorkspaceConfiguratio
 		case 'relative': return 'relative';
 		case 'non-relative': return 'non-relative';
 		default: return undefined;
+	}
+}
+
+function getImportModuleSpecifierEndingPreference(config: vscode.WorkspaceConfiguration) {
+	switch (config.get<string>('importModuleSpecifierEnding')) {
+		case 'minimal': return 'minimal';
+		case 'index': return 'index';
+		case 'js': return 'js';
+		default: return 'auto';
 	}
 }

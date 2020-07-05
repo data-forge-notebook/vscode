@@ -3,42 +3,46 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as os from 'os';
 import * as path from 'vs/base/common/path';
 import * as platform from 'vs/base/common/platform';
 import * as pty from 'node-pty';
 import * as fs from 'fs';
 import { Event, Emitter } from 'vs/base/common/event';
 import { getWindowsBuildNumber } from 'vs/workbench/contrib/terminal/node/terminal';
-import { IDisposable } from 'vs/base/common/lifecycle';
-import { IShellLaunchConfig, ITerminalChildProcess, SHELL_PATH_INVALID_EXIT_CODE, SHELL_PATH_DIRECTORY_EXIT_CODE, SHELL_CWD_INVALID_EXIT_CODE } from 'vs/workbench/contrib/terminal/common/terminal';
+import { Disposable } from 'vs/base/common/lifecycle';
+import { IShellLaunchConfig, ITerminalChildProcess, ITerminalLaunchError } from 'vs/workbench/contrib/terminal/common/terminal';
 import { exec } from 'child_process';
 import { ILogService } from 'vs/platform/log/common/log';
 import { stat } from 'vs/base/node/pfs';
 import { findExecutable } from 'vs/workbench/contrib/terminal/node/terminalEnvironment';
 import { URI } from 'vs/base/common/uri';
+import { localize } from 'vs/nls';
 
-export class TerminalProcess implements ITerminalChildProcess, IDisposable {
-	private _exitCode: number;
+export class TerminalProcess extends Disposable implements ITerminalChildProcess {
+	private _exitCode: number | undefined;
+	private _exitMessage: string | undefined;
 	private _closeTimeout: any;
 	private _ptyProcess: pty.IPty | undefined;
 	private _currentTitle: string = '';
-	private _processStartupComplete: Promise<void>;
+	private _processStartupComplete: Promise<void> | undefined;
 	private _isDisposed: boolean = false;
 	private _titleInterval: NodeJS.Timer | null = null;
-	private _initialCwd: string;
+	private readonly _initialCwd: string;
+	private readonly _ptyOptions: pty.IPtyForkOptions | pty.IWindowsPtyForkOptions;
 
-	private readonly _onProcessData = new Emitter<string>();
+	public get exitMessage(): string | undefined { return this._exitMessage; }
+
+	private readonly _onProcessData = this._register(new Emitter<string>());
 	public get onProcessData(): Event<string> { return this._onProcessData.event; }
-	private readonly _onProcessExit = new Emitter<number>();
+	private readonly _onProcessExit = this._register(new Emitter<number>());
 	public get onProcessExit(): Event<number> { return this._onProcessExit.event; }
-	private readonly _onProcessReady = new Emitter<{ pid: number, cwd: string }>();
+	private readonly _onProcessReady = this._register(new Emitter<{ pid: number, cwd: string }>());
 	public get onProcessReady(): Event<{ pid: number, cwd: string }> { return this._onProcessReady.event; }
-	private readonly _onProcessTitleChanged = new Emitter<string>();
+	private readonly _onProcessTitleChanged = this._register(new Emitter<string>());
 	public get onProcessTitleChanged(): Event<string> { return this._onProcessTitleChanged.event; }
 
 	constructor(
-		shellLaunchConfig: IShellLaunchConfig,
+		private readonly _shellLaunchConfig: IShellLaunchConfig,
 		cwd: string,
 		cols: number,
 		rows: number,
@@ -46,65 +50,81 @@ export class TerminalProcess implements ITerminalChildProcess, IDisposable {
 		windowsEnableConpty: boolean,
 		@ILogService private readonly _logService: ILogService
 	) {
-		let shellName: string;
-		if (os.platform() === 'win32') {
-			shellName = path.basename(shellLaunchConfig.executable || '');
+		super();
+		let name: string;
+		if (platform.isWindows) {
+			name = path.basename(this._shellLaunchConfig.executable || '');
 		} else {
 			// Using 'xterm-256color' here helps ensure that the majority of Linux distributions will use a
 			// color prompt as defined in the default ~/.bashrc file.
-			shellName = 'xterm-256color';
+			name = 'xterm-256color';
 		}
-
 		this._initialCwd = cwd;
-
 		const useConpty = windowsEnableConpty && process.platform === 'win32' && getWindowsBuildNumber() >= 18309;
-		const options: pty.IPtyForkOptions | pty.IWindowsPtyForkOptions = {
-			name: shellName,
+		this._ptyOptions = {
+			name,
 			cwd,
 			env,
 			cols,
 			rows,
-			experimentalUseConpty: useConpty,
-			conptyInheritCursor: true
+			useConpty,
+			// This option will force conpty to not redraw the whole viewport on launch
+			conptyInheritCursor: useConpty && !!_shellLaunchConfig.initialText
 		};
-
-		const cwdVerification = stat(cwd).then(async stat => {
-			if (!stat.isDirectory()) {
-				return Promise.reject(SHELL_CWD_INVALID_EXIT_CODE);
-			}
-		}, async err => {
-			if (err && err.code === 'ENOENT') {
-				// So we can include in the error message the specified CWD
-				shellLaunchConfig.cwd = cwd;
-				return Promise.reject(SHELL_CWD_INVALID_EXIT_CODE);
-			}
-		});
-
-		const exectuableVerification = stat(shellLaunchConfig.executable!).then(async stat => {
-			if (!stat.isFile() && !stat.isSymbolicLink()) {
-				return Promise.reject(stat.isDirectory() ? SHELL_PATH_DIRECTORY_EXIT_CODE : SHELL_PATH_INVALID_EXIT_CODE);
-			}
-		}, async (err) => {
-			if (err && err.code === 'ENOENT') {
-				let cwd = shellLaunchConfig.cwd instanceof URI ? shellLaunchConfig.cwd.path : shellLaunchConfig.cwd!;
-				const executable = await findExecutable(shellLaunchConfig.executable!, cwd);
-				if (!executable) {
-					return Promise.reject(SHELL_PATH_INVALID_EXIT_CODE);
-				}
-			}
-		});
-
-		Promise.all([cwdVerification, exectuableVerification]).then(() => {
-			this.setupPtyProcess(shellLaunchConfig, options);
-		}).catch((exitCode: number) => {
-			return this._launchFailed(exitCode);
-		});
 	}
 
-	private _launchFailed(exitCode: number): void {
-		this._exitCode = exitCode;
-		this._queueProcessExit();
-		this._processStartupComplete = Promise.resolve(undefined);
+	public async start(): Promise<ITerminalLaunchError | undefined> {
+		const results = await Promise.all([this._validateCwd(), this._validateExecutable()]);
+		const firstError = results.find(r => r !== undefined);
+		if (firstError) {
+			return firstError;
+		}
+
+		try {
+			this.setupPtyProcess(this._shellLaunchConfig, this._ptyOptions);
+			return undefined;
+		} catch (err) {
+			this._logService.trace('IPty#spawn native exception', err);
+			return { message: `A native exception occurred during launch (${err.message})` };
+		}
+	}
+
+	private async _validateCwd(): Promise<undefined | ITerminalLaunchError> {
+		try {
+			const result = await stat(this._initialCwd);
+			if (!result.isDirectory()) {
+				return { message: localize('launchFail.cwdNotDirectory', "Starting directory (cwd) \"{0}\" is not a directory", this._initialCwd.toString()) };
+			}
+		} catch (err) {
+			if (err?.code === 'ENOENT') {
+				return { message: localize('launchFail.cwdDoesNotExist', "Starting directory (cwd) \"{0}\" does not exist", this._initialCwd.toString()) };
+			}
+		}
+		return undefined;
+	}
+
+	private async _validateExecutable(): Promise<undefined | ITerminalLaunchError> {
+		const slc = this._shellLaunchConfig;
+		if (!slc.executable) {
+			throw new Error('IShellLaunchConfig.executable not set');
+		}
+		try {
+			const result = await stat(slc.executable);
+			if (!result.isFile() && !result.isSymbolicLink()) {
+				return { message: localize('launchFail.executableIsNotFileOrSymlink', "Path to shell executable \"{0}\" is not a file of a symlink", slc.executable) };
+			}
+		} catch (err) {
+			if (err?.code === 'ENOENT') {
+				// The executable isn't an absolute path, try find it on the PATH or CWD
+				let cwd = slc.cwd instanceof URI ? slc.cwd.path : slc.cwd!;
+				const envPaths: string[] | undefined = (slc.env && slc.env.PATH) ? slc.env.PATH.split(path.delimiter) : undefined;
+				const executable = await findExecutable(slc.executable!, cwd, envPaths);
+				if (!executable) {
+					return { message: localize('launchFail.executableDoesNotExist', "Path to shell executable \"{0}\" does not exist", slc.executable) };
+				}
+			}
+		}
+		return undefined;
 	}
 
 	private setupPtyProcess(shellLaunchConfig: IShellLaunchConfig, options: pty.IPtyForkOptions): void {
@@ -115,22 +135,19 @@ export class TerminalProcess implements ITerminalChildProcess, IDisposable {
 		this._processStartupComplete = new Promise<void>(c => {
 			this.onProcessReady(() => c());
 		});
-		ptyProcess.on('data', data => {
+		ptyProcess.onData(data => {
 			this._onProcessData.fire(data);
 			if (this._closeTimeout) {
 				clearTimeout(this._closeTimeout);
 				this._queueProcessExit();
 			}
 		});
-		ptyProcess.on('exit', code => {
-			this._exitCode = code;
+		ptyProcess.onExit(e => {
+			this._exitCode = e.exitCode;
 			this._queueProcessExit();
 		});
 		this._setupTitlePolling(ptyProcess);
-		// TODO: We should no longer need to delay this since pty.spawn is sync
-		setTimeout(() => {
-			this._sendProcessId(ptyProcess);
-		}, 500);
+		this._sendProcessId(ptyProcess.pid);
 	}
 
 	public dispose(): void {
@@ -143,6 +160,7 @@ export class TerminalProcess implements ITerminalChildProcess, IDisposable {
 		this._onProcessExit.dispose();
 		this._onProcessReady.dispose();
 		this._onProcessTitleChanged.dispose();
+		super.dispose();
 	}
 
 	private _setupTitlePolling(ptyProcess: pty.IPty) {
@@ -169,30 +187,29 @@ export class TerminalProcess implements ITerminalChildProcess, IDisposable {
 		this._closeTimeout = setTimeout(() => this._kill(), 250);
 	}
 
-	private _kill(): void {
+	private async _kill(): Promise<void> {
 		// Wait to kill to process until the start up code has run. This prevents us from firing a process exit before a
 		// process start.
-		this._processStartupComplete.then(() => {
-			if (this._isDisposed) {
-				return;
+		await this._processStartupComplete;
+		if (this._isDisposed) {
+			return;
+		}
+		// Attempt to kill the pty, it may have already been killed at this
+		// point but we want to make sure
+		try {
+			if (this._ptyProcess) {
+				this._logService.trace('IPty#kill');
+				this._ptyProcess.kill();
 			}
-			// Attempt to kill the pty, it may have already been killed at this
-			// point but we want to make sure
-			try {
-				if (this._ptyProcess) {
-					this._logService.trace('IPty#kill');
-					this._ptyProcess.kill();
-				}
-			} catch (ex) {
-				// Swallow, the pty has already been killed
-			}
-			this._onProcessExit.fire(this._exitCode);
-			this.dispose();
-		});
+		} catch (ex) {
+			// Swallow, the pty has already been killed
+		}
+		this._onProcessExit.fire(this._exitCode || 0);
+		this.dispose();
 	}
 
-	private _sendProcessId(ptyProcess: pty.IPty) {
-		this._onProcessReady.fire({ pid: ptyProcess.pid, cwd: this._initialCwd });
+	private _sendProcessId(pid: number) {
+		this._onProcessReady.fire({ pid, cwd: this._initialCwd });
 	}
 
 	private _sendProcessTitle(ptyProcess: pty.IPty): void {
@@ -232,7 +249,14 @@ export class TerminalProcess implements ITerminalChildProcess, IDisposable {
 			cols = Math.max(cols, 1);
 			rows = Math.max(rows, 1);
 			this._logService.trace('IPty#resize', cols, rows);
-			this._ptyProcess.resize(cols, rows);
+			try {
+				this._ptyProcess.resize(cols, rows);
+			} catch (e) {
+				// Swallow error if the pty has already exited
+				if (this._exitCode !== undefined) {
+					throw e;
+				}
+			}
 		}
 	}
 
@@ -248,7 +272,7 @@ export class TerminalProcess implements ITerminalChildProcess, IDisposable {
 					return;
 				}
 				this._logService.trace('IPty#pid');
-				exec('lsof -p ' + this._ptyProcess.pid + ' | grep cwd', (error, stdout, stderr) => {
+				exec('lsof -OPl -p ' + this._ptyProcess.pid + ' | grep cwd', (error, stdout, stderr) => {
 					if (stdout !== '') {
 						resolve(stdout.substring(stdout.indexOf('/'), stdout.length - 1));
 					}

@@ -23,13 +23,14 @@ const defaultStyles: ISplitViewStyles = {
 	separatorBorder: Color.transparent
 };
 
-export interface ISplitViewOptions {
-	orientation?: Orientation; // default Orientation.VERTICAL
-	styles?: ISplitViewStyles;
-	orthogonalStartSash?: Sash;
-	orthogonalEndSash?: Sash;
-	inverseAltBehavior?: boolean;
-	proportionalLayout?: boolean; // default true
+export interface ISplitViewOptions<TLayoutContext = undefined> {
+	readonly orientation?: Orientation; // default Orientation.VERTICAL
+	readonly styles?: ISplitViewStyles;
+	readonly orthogonalStartSash?: Sash;
+	readonly orthogonalEndSash?: Sash;
+	readonly inverseAltBehavior?: boolean;
+	readonly proportionalLayout?: boolean; // default true,
+	readonly descriptor?: ISplitViewDescriptor<TLayoutContext>;
 }
 
 /**
@@ -41,27 +42,27 @@ export const enum LayoutPriority {
 	High
 }
 
-export interface IView {
+export interface IView<TLayoutContext = undefined> {
 	readonly element: HTMLElement;
 	readonly minimumSize: number;
 	readonly maximumSize: number;
 	readonly onDidChange: Event<number | undefined>;
 	readonly priority?: LayoutPriority;
 	readonly snap?: boolean;
-	layout(size: number, orientation: Orientation): void;
+	layout(size: number, offset: number, context: TLayoutContext | undefined): void;
 	setVisible?(visible: boolean): void;
 }
 
 interface ISashEvent {
-	sash: Sash;
-	start: number;
-	current: number;
-	alt: boolean;
+	readonly sash: Sash;
+	readonly start: number;
+	readonly current: number;
+	readonly alt: boolean;
 }
 
 type ViewItemSize = number | { cachedVisibleSize: number };
 
-abstract class ViewItem {
+abstract class ViewItem<TLayoutContext> {
 
 	private _size: number;
 	set size(size: number) {
@@ -79,7 +80,7 @@ abstract class ViewItem {
 		return typeof this._cachedVisibleSize === 'undefined';
 	}
 
-	set visible(visible: boolean) {
+	setVisible(visible: boolean, size?: number): void {
 		if (visible === this.visible) {
 			return;
 		}
@@ -88,7 +89,7 @@ abstract class ViewItem {
 			this.size = clamp(this._cachedVisibleSize!, this.viewMinimumSize, this.viewMaximumSize);
 			this._cachedVisibleSize = undefined;
 		} else {
-			this._cachedVisibleSize = this.size;
+			this._cachedVisibleSize = typeof size === 'number' ? size : this.size;
 			this.size = 0;
 		}
 
@@ -108,48 +109,52 @@ abstract class ViewItem {
 	get priority(): LayoutPriority | undefined { return this.view.priority; }
 	get snap(): boolean { return !!this.view.snap; }
 
+	set enabled(enabled: boolean) {
+		this.container.style.pointerEvents = enabled ? '' : 'none';
+	}
+
 	constructor(
 		protected container: HTMLElement,
-		private view: IView,
+		private view: IView<TLayoutContext>,
 		size: ViewItemSize,
 		private disposable: IDisposable
 	) {
 		if (typeof size === 'number') {
 			this._size = size;
 			this._cachedVisibleSize = undefined;
+			dom.addClass(container, 'visible');
 		} else {
 			this._size = 0;
 			this._cachedVisibleSize = size.cachedVisibleSize;
 		}
-
-		dom.addClass(container, 'visible');
 	}
 
-	abstract layout(): void;
-
-	layoutView(orientation: Orientation): void {
-		this.view.layout(this.size, orientation);
+	layout(offset: number, layoutContext: TLayoutContext | undefined): void {
+		this.layoutContainer(offset);
+		this.view.layout(this.size, offset, layoutContext);
 	}
 
-	dispose(): IView {
+	abstract layoutContainer(offset: number): void;
+
+	dispose(): IView<TLayoutContext> {
 		this.disposable.dispose();
 		return this.view;
 	}
 }
 
-class VerticalViewItem extends ViewItem {
+class VerticalViewItem<TLayoutContext> extends ViewItem<TLayoutContext> {
 
-	layout(): void {
+	layoutContainer(offset: number): void {
+		this.container.style.top = `${offset}px`;
 		this.container.style.height = `${this.size}px`;
-		this.layoutView(Orientation.VERTICAL);
 	}
 }
 
-class HorizontalViewItem extends ViewItem {
+class HorizontalViewItem<TLayoutContext> extends ViewItem<TLayoutContext> {
 
-	layout(): void {
+	layoutContainer(offset: number): void {
+		this.container.style.left = `${offset}px`;
 		this.container.style.width = `${this.size}px`;
-		this.layoutView(Orientation.HORIZONTAL);
 	}
 }
 
@@ -161,6 +166,7 @@ interface ISashItem {
 interface ISashDragSnapState {
 	readonly index: number;
 	readonly limitDelta: number;
+	readonly size: number;
 }
 
 interface ISashDragState {
@@ -192,18 +198,28 @@ export namespace Sizing {
 	export function Invisible(cachedVisibleSize: number): InvisibleSizing { return { type: 'invisible', cachedVisibleSize }; }
 }
 
-export class SplitView extends Disposable {
+export interface ISplitViewDescriptor<TLayoutContext> {
+	size: number;
+	views: {
+		visible?: boolean;
+		size: number;
+		view: IView<TLayoutContext>;
+	}[];
+}
+
+export class SplitView<TLayoutContext = undefined> extends Disposable {
 
 	readonly orientation: Orientation;
 	readonly el: HTMLElement;
 	private sashContainer: HTMLElement;
 	private viewContainer: HTMLElement;
 	private size = 0;
+	private layoutContext: TLayoutContext | undefined;
 	private contentSize = 0;
 	private proportions: undefined | number[] = undefined;
-	private viewItems: ViewItem[] = [];
+	private viewItems: ViewItem<TLayoutContext>[] = [];
 	private sashItems: ISashItem[] = [];
-	private sashDragState: ISashDragState;
+	private sashDragState: ISashDragState | undefined;
 	private state: State = State.Idle;
 	private inverseAltBehavior: boolean;
 	private proportionalLayout: boolean;
@@ -250,7 +266,29 @@ export class SplitView extends Disposable {
 		return this.sashItems.map(s => s.sash);
 	}
 
-	constructor(container: HTMLElement, options: ISplitViewOptions = {}) {
+	private _startSnappingEnabled = true;
+	get startSnappingEnabled(): boolean { return this._startSnappingEnabled; }
+	set startSnappingEnabled(startSnappingEnabled: boolean) {
+		if (this._startSnappingEnabled === startSnappingEnabled) {
+			return;
+		}
+
+		this._startSnappingEnabled = startSnappingEnabled;
+		this.updateSashEnablement();
+	}
+
+	private _endSnappingEnabled = true;
+	get endSnappingEnabled(): boolean { return this._endSnappingEnabled; }
+	set endSnappingEnabled(endSnappingEnabled: boolean) {
+		if (this._endSnappingEnabled === endSnappingEnabled) {
+			return;
+		}
+
+		this._endSnappingEnabled = endSnappingEnabled;
+		this.updateSashEnablement();
+	}
+
+	constructor(container: HTMLElement, options: ISplitViewOptions<TLayoutContext> = {}) {
 		super();
 
 		this.orientation = types.isUndefined(options.orientation) ? Orientation.VERTICAL : options.orientation;
@@ -266,6 +304,21 @@ export class SplitView extends Disposable {
 		this.viewContainer = dom.append(this.el, dom.$('.split-view-container'));
 
 		this.style(options.styles || defaultStyles);
+
+		// We have an existing set of view, add them now
+		if (options.descriptor) {
+			this.size = options.descriptor.size;
+			options.descriptor.views.forEach((viewDescriptor, index) => {
+				const sizing = types.isUndefined(viewDescriptor.visible) || viewDescriptor.visible ? viewDescriptor.size : { type: 'invisible', cachedVisibleSize: viewDescriptor.size } as InvisibleSizing;
+
+				const view = viewDescriptor.view;
+				this.doAddView(view, sizing, index, true);
+			});
+
+			// Initialize content size and proportions for first layout
+			this.contentSize = this.viewItems.reduce((r, i) => r + i.size, 0);
+			this.saveProportions();
+		}
 	}
 
 	style(styles: ISplitViewStyles): void {
@@ -278,106 +331,11 @@ export class SplitView extends Disposable {
 		}
 	}
 
-	addView(view: IView, size: number | Sizing, index = this.viewItems.length): void {
-		if (this.state !== State.Idle) {
-			throw new Error('Cant modify splitview');
-		}
-
-		this.state = State.Busy;
-
-		// Add view
-		const container = dom.$('.split-view-view');
-
-		if (index === this.viewItems.length) {
-			this.viewContainer.appendChild(container);
-		} else {
-			this.viewContainer.insertBefore(container, this.viewContainer.children.item(index));
-		}
-
-		const onChangeDisposable = view.onDidChange(size => this.onViewChange(item, size));
-		const containerDisposable = toDisposable(() => this.viewContainer.removeChild(container));
-		const disposable = combinedDisposable(onChangeDisposable, containerDisposable);
-
-		let viewSize: ViewItemSize;
-
-		if (typeof size === 'number') {
-			viewSize = size;
-		} else if (size.type === 'split') {
-			viewSize = this.getViewSize(size.index) / 2;
-		} else if (size.type === 'invisible') {
-			viewSize = { cachedVisibleSize: size.cachedVisibleSize };
-		} else {
-			viewSize = view.minimumSize;
-		}
-
-		const item = this.orientation === Orientation.VERTICAL
-			? new VerticalViewItem(container, view, viewSize, disposable)
-			: new HorizontalViewItem(container, view, viewSize, disposable);
-
-		this.viewItems.splice(index, 0, item);
-
-		// Add sash
-		if (this.viewItems.length > 1) {
-			const orientation = this.orientation === Orientation.VERTICAL ? Orientation.HORIZONTAL : Orientation.VERTICAL;
-			const layoutProvider = this.orientation === Orientation.VERTICAL ? { getHorizontalSashTop: (sash: Sash) => this.getSashPosition(sash) } : { getVerticalSashLeft: (sash: Sash) => this.getSashPosition(sash) };
-			const sash = new Sash(this.sashContainer, layoutProvider, {
-				orientation,
-				orthogonalStartSash: this.orthogonalStartSash,
-				orthogonalEndSash: this.orthogonalEndSash
-			});
-
-			const sashEventMapper = this.orientation === Orientation.VERTICAL
-				? (e: IBaseSashEvent) => ({ sash, start: e.startY, current: e.currentY, alt: e.altKey })
-				: (e: IBaseSashEvent) => ({ sash, start: e.startX, current: e.currentX, alt: e.altKey });
-
-			const onStart = Event.map(sash.onDidStart, sashEventMapper);
-			const onStartDisposable = onStart(this.onSashStart, this);
-			const onChange = Event.map(sash.onDidChange, sashEventMapper);
-			const onChangeDisposable = onChange(this.onSashChange, this);
-			const onEnd = Event.map(sash.onDidEnd, () => firstIndex(this.sashItems, item => item.sash === sash));
-			const onEndDisposable = onEnd(this.onSashEnd, this);
-
-			const onDidResetDisposable = sash.onDidReset(() => {
-				const index = firstIndex(this.sashItems, item => item.sash === sash);
-				const upIndexes = range(index, -1);
-				const downIndexes = range(index + 1, this.viewItems.length);
-				const snapBeforeIndex = this.findFirstSnapIndex(upIndexes);
-				const snapAfterIndex = this.findFirstSnapIndex(downIndexes);
-
-				if (typeof snapBeforeIndex === 'number' && !this.viewItems[snapBeforeIndex].visible) {
-					return;
-				}
-
-				if (typeof snapAfterIndex === 'number' && !this.viewItems[snapAfterIndex].visible) {
-					return;
-				}
-
-				this._onDidSashReset.fire(index);
-			});
-
-			const disposable = combinedDisposable(onStartDisposable, onChangeDisposable, onEndDisposable, onDidResetDisposable, sash);
-			const sashItem: ISashItem = { sash, disposable };
-
-			this.sashItems.splice(index - 1, 0, sashItem);
-		}
-
-		container.appendChild(view.element);
-
-		let highPriorityIndexes: number[] | undefined;
-
-		if (typeof size !== 'number' && size.type === 'split') {
-			highPriorityIndexes = [size.index];
-		}
-
-		this.relayout([index], highPriorityIndexes);
-		this.state = State.Idle;
-
-		if (typeof size !== 'number' && size.type === 'distribute') {
-			this.distributeViewSizes();
-		}
+	addView(view: IView<TLayoutContext>, size: number | Sizing, index = this.viewItems.length, skipLayout?: boolean): void {
+		this.doAddView(view, size, index, skipLayout);
 	}
 
-	removeView(index: number, sizing?: Sizing): IView {
+	removeView(index: number, sizing?: Sizing): IView<TLayoutContext> {
 		if (this.state !== State.Idle) {
 			throw new Error('Cant modify splitview');
 		}
@@ -414,9 +372,10 @@ export class SplitView extends Disposable {
 			throw new Error('Cant modify splitview');
 		}
 
-		const size = this.getViewSize(from);
+		const cachedVisibleSize = this.getViewCachedVisibleSize(from);
+		const sizing = typeof cachedVisibleSize === 'undefined' ? this.getViewSize(from) : Sizing.Invisible(cachedVisibleSize);
 		const view = this.removeView(from);
-		this.addView(view, size, to);
+		this.addView(view, sizing, to);
 	}
 
 	swapViews(from: number, to: number): void {
@@ -452,10 +411,11 @@ export class SplitView extends Disposable {
 		}
 
 		const viewItem = this.viewItems[index];
-		viewItem.visible = visible;
+		viewItem.setVisible(visible);
 
 		this.distributeEmptySpace(index);
 		this.layoutViews();
+		this.saveProportions();
 	}
 
 	getViewCachedVisibleSize(index: number): number | undefined {
@@ -467,9 +427,10 @@ export class SplitView extends Disposable {
 		return viewItem.cachedVisibleSize;
 	}
 
-	layout(size: number): void {
+	layout(size: number, layoutContext?: TLayoutContext): void {
 		const previousSize = Math.max(this.size, this.contentSize);
 		this.size = size;
+		this.layoutContext = layoutContext;
 
 		if (!this.proportions) {
 			const indexes = range(this.viewItems.length);
@@ -495,12 +456,16 @@ export class SplitView extends Disposable {
 	}
 
 	private onSashStart({ sash, start, alt }: ISashEvent): void {
+		for (const item of this.viewItems) {
+			item.enabled = false;
+		}
+
 		const index = firstIndex(this.sashItems, item => item.sash === sash);
 
 		// This way, we can press Alt while we resize a sash, macOS style!
 		const disposable = combinedDisposable(
-			domEvent(document.body, 'keydown')(e => resetSashDragState(this.sashDragState.current, e.altKey)),
-			domEvent(document.body, 'keyup')(() => resetSashDragState(this.sashDragState.current, false))
+			domEvent(document.body, 'keydown')(e => resetSashDragState(this.sashDragState!.current, e.altKey)),
+			domEvent(document.body, 'keyup')(() => resetSashDragState(this.sashDragState!.current, false))
 		);
 
 		const resetSashDragState = (start: number, alt: boolean) => {
@@ -550,7 +515,8 @@ export class SplitView extends Disposable {
 
 					snapBefore = {
 						index: snapBeforeIndex,
-						limitDelta: viewItem.visible ? minDelta - halfSize : minDelta + halfSize
+						limitDelta: viewItem.visible ? minDelta - halfSize : minDelta + halfSize,
+						size: viewItem.size
 					};
 				}
 
@@ -560,7 +526,8 @@ export class SplitView extends Disposable {
 
 					snapAfter = {
 						index: snapAfterIndex,
-						limitDelta: viewItem.visible ? maxDelta + halfSize : maxDelta - halfSize
+						limitDelta: viewItem.visible ? maxDelta + halfSize : maxDelta - halfSize,
+						size: viewItem.size
 					};
 				}
 			}
@@ -572,8 +539,8 @@ export class SplitView extends Disposable {
 	}
 
 	private onSashChange({ current }: ISashEvent): void {
-		const { index, start, sizes, alt, minDelta, maxDelta, snapBefore, snapAfter } = this.sashDragState;
-		this.sashDragState.current = current;
+		const { index, start, sizes, alt, minDelta, maxDelta, snapBefore, snapAfter } = this.sashDragState!;
+		this.sashDragState!.current = current;
 
 		const delta = current - start;
 		const newDelta = this.resize(index, delta, sizes, undefined, undefined, minDelta, maxDelta, snapBefore, snapAfter);
@@ -596,11 +563,15 @@ export class SplitView extends Disposable {
 
 	private onSashEnd(index: number): void {
 		this._onDidSashChange.fire(index);
-		this.sashDragState.disposable.dispose();
+		this.sashDragState!.disposable.dispose();
 		this.saveProportions();
+
+		for (const item of this.viewItems) {
+			item.enabled = true;
+		}
 	}
 
-	private onViewChange(item: ViewItem, size: number | undefined): void {
+	private onViewChange(item: ViewItem<TLayoutContext>, size: number | undefined): void {
 		const index = this.viewItems.indexOf(item);
 
 		if (index < 0 || index >= this.viewItems.length) {
@@ -647,7 +618,7 @@ export class SplitView extends Disposable {
 	}
 
 	distributeViewSizes(): void {
-		const flexibleViewItems: ViewItem[] = [];
+		const flexibleViewItems: ViewItem<TLayoutContext>[] = [];
 		let flexibleSize = 0;
 
 		for (const item of this.viewItems) {
@@ -676,6 +647,112 @@ export class SplitView extends Disposable {
 		}
 
 		return this.viewItems[index].size;
+	}
+
+	private doAddView(view: IView<TLayoutContext>, size: number | Sizing, index = this.viewItems.length, skipLayout?: boolean): void {
+		if (this.state !== State.Idle) {
+			throw new Error('Cant modify splitview');
+		}
+
+		this.state = State.Busy;
+
+		// Add view
+		const container = dom.$('.split-view-view');
+
+		if (index === this.viewItems.length) {
+			this.viewContainer.appendChild(container);
+		} else {
+			this.viewContainer.insertBefore(container, this.viewContainer.children.item(index));
+		}
+
+		const onChangeDisposable = view.onDidChange(size => this.onViewChange(item, size));
+		const containerDisposable = toDisposable(() => this.viewContainer.removeChild(container));
+		const disposable = combinedDisposable(onChangeDisposable, containerDisposable);
+
+		let viewSize: ViewItemSize;
+
+		if (typeof size === 'number') {
+			viewSize = size;
+		} else if (size.type === 'split') {
+			viewSize = this.getViewSize(size.index) / 2;
+		} else if (size.type === 'invisible') {
+			viewSize = { cachedVisibleSize: size.cachedVisibleSize };
+		} else {
+			viewSize = view.minimumSize;
+		}
+
+		const item = this.orientation === Orientation.VERTICAL
+			? new VerticalViewItem(container, view, viewSize, disposable)
+			: new HorizontalViewItem(container, view, viewSize, disposable);
+
+		this.viewItems.splice(index, 0, item);
+
+		// Add sash
+		if (this.viewItems.length > 1) {
+			const sash = this.orientation === Orientation.VERTICAL
+				? new Sash(this.sashContainer, { getHorizontalSashTop: (sash: Sash) => this.getSashPosition(sash) }, {
+					orientation: Orientation.HORIZONTAL,
+					orthogonalStartSash: this.orthogonalStartSash,
+					orthogonalEndSash: this.orthogonalEndSash
+				})
+				: new Sash(this.sashContainer, { getVerticalSashLeft: (sash: Sash) => this.getSashPosition(sash) }, {
+					orientation: Orientation.VERTICAL,
+					orthogonalStartSash: this.orthogonalStartSash,
+					orthogonalEndSash: this.orthogonalEndSash
+				});
+
+			const sashEventMapper = this.orientation === Orientation.VERTICAL
+				? (e: IBaseSashEvent) => ({ sash, start: e.startY, current: e.currentY, alt: e.altKey })
+				: (e: IBaseSashEvent) => ({ sash, start: e.startX, current: e.currentX, alt: e.altKey });
+
+			const onStart = Event.map(sash.onDidStart, sashEventMapper);
+			const onStartDisposable = onStart(this.onSashStart, this);
+			const onChange = Event.map(sash.onDidChange, sashEventMapper);
+			const onChangeDisposable = onChange(this.onSashChange, this);
+			const onEnd = Event.map(sash.onDidEnd, () => firstIndex(this.sashItems, item => item.sash === sash));
+			const onEndDisposable = onEnd(this.onSashEnd, this);
+
+			const onDidResetDisposable = sash.onDidReset(() => {
+				const index = firstIndex(this.sashItems, item => item.sash === sash);
+				const upIndexes = range(index, -1);
+				const downIndexes = range(index + 1, this.viewItems.length);
+				const snapBeforeIndex = this.findFirstSnapIndex(upIndexes);
+				const snapAfterIndex = this.findFirstSnapIndex(downIndexes);
+
+				if (typeof snapBeforeIndex === 'number' && !this.viewItems[snapBeforeIndex].visible) {
+					return;
+				}
+
+				if (typeof snapAfterIndex === 'number' && !this.viewItems[snapAfterIndex].visible) {
+					return;
+				}
+
+				this._onDidSashReset.fire(index);
+			});
+
+			const disposable = combinedDisposable(onStartDisposable, onChangeDisposable, onEndDisposable, onDidResetDisposable, sash);
+			const sashItem: ISashItem = { sash, disposable };
+
+			this.sashItems.splice(index - 1, 0, sashItem);
+		}
+
+		container.appendChild(view.element);
+
+		let highPriorityIndexes: number[] | undefined;
+
+		if (typeof size !== 'number' && size.type === 'split') {
+			highPriorityIndexes = [size.index];
+		}
+
+		if (!skipLayout) {
+			this.relayout([index], highPriorityIndexes);
+		}
+
+		this.state = State.Idle;
+
+		if (!skipLayout && typeof size !== 'number' && size.type === 'distribute') {
+			this.distributeViewSizes();
+		}
 	}
 
 	private relayout(lowPriorityIndexes?: number[], highPriorityIndexes?: number[]): void {
@@ -738,14 +815,14 @@ export class SplitView extends Disposable {
 			const snapView = this.viewItems[snapBefore.index];
 			const visible = delta >= snapBefore.limitDelta;
 			snapped = visible !== snapView.visible;
-			snapView.visible = visible;
+			snapView.setVisible(visible, snapBefore.size);
 		}
 
 		if (!snapped && snapAfter) {
 			const snapView = this.viewItems[snapAfter.index];
 			const visible = delta < snapAfter.limitDelta;
 			snapped = visible !== snapView.visible;
-			snapView.visible = visible;
+			snapView.setVisible(visible, snapAfter.size);
 		}
 
 		if (snapped) {
@@ -810,12 +887,19 @@ export class SplitView extends Disposable {
 		this.contentSize = this.viewItems.reduce((r, i) => r + i.size, 0);
 
 		// Layout views
-		this.viewItems.forEach(item => item.layout());
+		let offset = 0;
+
+		for (const viewItem of this.viewItems) {
+			viewItem.layout(offset, this.layoutContext);
+			offset += viewItem.size;
+		}
 
 		// Layout sashes
 		this.sashItems.forEach(item => item.sash.layout());
+		this.updateSashEnablement();
+	}
 
-		// Update sashes enablement
+	private updateSashEnablement(): void {
 		let previous = false;
 		const collapsesDown = this.viewItems.map(i => previous = (i.size - i.minimumSize > 0) || previous);
 
@@ -829,7 +913,12 @@ export class SplitView extends Disposable {
 		previous = false;
 		const expandsUp = reverseViews.map(i => previous = (i.maximumSize - i.size > 0) || previous).reverse();
 
-		this.sashItems.forEach(({ sash }, index) => {
+		let position = 0;
+		for (let index = 0; index < this.sashItems.length; index++) {
+			const { sash } = this.sashItems[index];
+			const viewItem = this.viewItems[index];
+			position += viewItem.size;
+
 			const min = !(collapsesDown[index] && expandsUp[index + 1]);
 			const max = !(expandsDown[index] && collapsesUp[index + 1]);
 
@@ -839,9 +928,12 @@ export class SplitView extends Disposable {
 				const snapBeforeIndex = this.findFirstSnapIndex(upIndexes);
 				const snapAfterIndex = this.findFirstSnapIndex(downIndexes);
 
-				if (typeof snapBeforeIndex === 'number' && !this.viewItems[snapBeforeIndex].visible) {
+				const snappedBefore = typeof snapBeforeIndex === 'number' && !this.viewItems[snapBeforeIndex].visible;
+				const snappedAfter = typeof snapAfterIndex === 'number' && !this.viewItems[snapAfterIndex].visible;
+
+				if (snappedBefore && collapsesUp[index] && (position > 0 || this.startSnappingEnabled)) {
 					sash.state = SashState.Minimum;
-				} else if (typeof snapAfterIndex === 'number' && !this.viewItems[snapAfterIndex].visible) {
+				} else if (snappedAfter && collapsesDown[index] && (position < this.contentSize || this.endSnappingEnabled)) {
 					sash.state = SashState.Maximum;
 				} else {
 					sash.state = SashState.Disabled;
@@ -853,8 +945,7 @@ export class SplitView extends Disposable {
 			} else {
 				sash.state = SashState.Enabled;
 			}
-			// }
-		});
+		}
 	}
 
 	private getSashPosition(sash: Sash): number {

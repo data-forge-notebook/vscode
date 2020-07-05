@@ -3,11 +3,10 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { MarkedString, CompletionItemKind, CompletionItem, DocumentSelector, SnippetString, workspace } from 'vscode';
+import { MarkedString, CompletionItemKind, CompletionItem, DocumentSelector, SnippetString, workspace, MarkdownString } from 'vscode';
 import { IJSONContribution, ISuggestionsCollector } from './jsonContributions';
 import { XHRRequest } from 'request-light';
 import { Location } from 'jsonc-parser';
-import { textToMarkedString } from './markedTextUtil';
 
 import * as cp from 'child_process';
 import * as nls from 'vscode-nls';
@@ -28,14 +27,12 @@ export class PackageJSONContribution implements IJSONContribution {
 		'jsdom', 'stylus', 'when', 'readable-stream', 'aws-sdk', 'concat-stream', 'chai', 'Thenable', 'wrench'];
 
 	private knownScopes = ['@types', '@angular', '@babel', '@nuxtjs', '@vue', '@bazel'];
-	private xhr: XHRRequest;
 
 	public getDocumentSelector(): DocumentSelector {
 		return [{ language: 'json', scheme: '*', pattern: '**/package.json' }];
 	}
 
-	public constructor(xhr: XHRRequest) {
-		this.xhr = xhr;
+	public constructor(private xhr: XHRRequest, private canRunNPM: boolean) {
 	}
 
 	public collectDefaultSuggestions(_fileName: string, result: ISuggestionsCollector): Thenable<any> {
@@ -182,11 +179,7 @@ export class PackageJSONContribution implements IJSONContribution {
 		return Promise.resolve(null);
 	}
 
-	public collectValueSuggestions(
-		_fileName: string,
-		location: Location,
-		result: ISuggestionsCollector
-	): Thenable<any> | null {
+	public async collectValueSuggestions(_fileName: string, location: Location, result: ISuggestionsCollector): Promise<any> {
 		if (!this.onlineEnabled()) {
 			return null;
 		}
@@ -194,47 +187,56 @@ export class PackageJSONContribution implements IJSONContribution {
 		if ((location.matches(['dependencies', '*']) || location.matches(['devDependencies', '*']) || location.matches(['optionalDependencies', '*']) || location.matches(['peerDependencies', '*']))) {
 			const currentKey = location.path[location.path.length - 1];
 			if (typeof currentKey === 'string') {
-				return this.npmView(currentKey).then(info => {
-					const latest = info.distTagsLatest;
-					if (latest) {
-						let name = JSON.stringify(latest);
-						let proposal = new CompletionItem(name);
-						proposal.kind = CompletionItemKind.Property;
-						proposal.insertText = name;
-						proposal.documentation = localize('json.npm.latestversion', 'The currently latest version of the package');
-						result.add(proposal);
+				const info = await this.fetchPackageInfo(currentKey);
+				if (info && info.version) {
 
-						name = JSON.stringify('^' + latest);
-						proposal = new CompletionItem(name);
-						proposal.kind = CompletionItemKind.Property;
-						proposal.insertText = name;
-						proposal.documentation = localize('json.npm.majorversion', 'Matches the most recent major version (1.x.x)');
-						result.add(proposal);
+					let name = JSON.stringify(info.version);
+					let proposal = new CompletionItem(name);
+					proposal.kind = CompletionItemKind.Property;
+					proposal.insertText = name;
+					proposal.documentation = localize('json.npm.latestversion', 'The currently latest version of the package');
+					result.add(proposal);
 
-						name = JSON.stringify('~' + latest);
-						proposal = new CompletionItem(name);
-						proposal.kind = CompletionItemKind.Property;
-						proposal.insertText = name;
-						proposal.documentation = localize('json.npm.minorversion', 'Matches the most recent minor version (1.2.x)');
-						result.add(proposal);
-					}
-					return 0;
-				}, () => {
-					return 0;
-				});
+					name = JSON.stringify('^' + info.version);
+					proposal = new CompletionItem(name);
+					proposal.kind = CompletionItemKind.Property;
+					proposal.insertText = name;
+					proposal.documentation = localize('json.npm.majorversion', 'Matches the most recent major version (1.x.x)');
+					result.add(proposal);
+
+					name = JSON.stringify('~' + info.version);
+					proposal = new CompletionItem(name);
+					proposal.kind = CompletionItemKind.Property;
+					proposal.insertText = name;
+					proposal.documentation = localize('json.npm.minorversion', 'Matches the most recent minor version (1.2.x)');
+					result.add(proposal);
+				}
 			}
 		}
 		return null;
 	}
 
+	private getDocumentation(description: string | undefined, version: string | undefined, homepage: string | undefined): MarkdownString {
+		const str = new MarkdownString();
+		if (description) {
+			str.appendText(description);
+		}
+		if (version) {
+			str.appendText('\n\n');
+			str.appendText(localize('json.npm.version.hover', 'Latest version: {0}', version));
+		}
+		if (homepage) {
+			str.appendText('\n\n');
+			str.appendText(homepage);
+		}
+		return str;
+	}
+
 	public resolveSuggestion(item: CompletionItem): Thenable<CompletionItem | null> | null {
-		if (item.kind === CompletionItemKind.Property && item.documentation === '') {
-			return this.getInfo(item.label).then(infos => {
-				if (infos.length > 0) {
-					item.documentation = infos[0];
-					if (infos.length > 1) {
-						item.detail = infos[1];
-					}
+		if (item.kind === CompletionItemKind.Property && !item.documentation) {
+			return this.fetchPackageInfo(item.label).then(info => {
+				if (info) {
+					item.documentation = this.getDocumentation(info.description, info.version, info.homepage);
 					return item;
 				}
 				return null;
@@ -243,46 +245,70 @@ export class PackageJSONContribution implements IJSONContribution {
 		return null;
 	}
 
-	private getInfo(pack: string): Thenable<string[]> {
-		return this.npmView(pack).then(info => {
-			const result: string[] = [];
-			result.push(info.description || '');
-			result.push(info.distTagsLatest ? localize('json.npm.version.hover', 'Latest version: {0}', info.distTagsLatest) : '');
-			result.push(info.homepage || '');
-			return result;
-		}, () => {
-			return [];
+	private async fetchPackageInfo(pack: string): Promise<ViewPackageInfo | undefined> {
+		let info: ViewPackageInfo | undefined;
+		if (this.canRunNPM) {
+			info = await this.npmView(pack);
+		}
+		if (!info) {
+			info = await this.npmjsView(pack);
+		}
+		return info;
+	}
+
+
+	private npmView(pack: string): Promise<ViewPackageInfo | undefined> {
+		return new Promise((resolve, _reject) => {
+			const command = 'npm view --json ' + pack + ' description dist-tags.latest homepage version';
+			cp.exec(command, (error, stdout) => {
+				if (!error) {
+					try {
+						const content = JSON.parse(stdout);
+						resolve({
+							description: content['description'],
+							version: content['dist-tags.latest'] || content['version'],
+							homepage: content['homepage']
+						});
+						return;
+					} catch (e) {
+						// ignore
+					}
+				}
+				resolve(undefined);
+			});
 		});
 	}
 
-	private npmView(pack: string): Promise<ViewPackageInfo> {
-		return new Promise((resolve, reject) => {
-			const command = 'npm view --json ' + pack + ' description dist-tags.latest homepage';
-			cp.exec(command, (error, stdout) => {
-				if (error) {
-					return reject();
-				}
-				try {
-					const content = JSON.parse(stdout);
-					resolve({
-						description: content['description'],
-						distTagsLatest: content['dist-tags.latest'],
-						homepage: content['homepage']
-					});
-				} catch (e) {
-					reject();
-				}
+	private async npmjsView(pack: string): Promise<ViewPackageInfo | undefined> {
+		const queryUrl = 'https://api.npms.io/v2/package/' + encodeURIComponent(pack);
+		try {
+			const success = await this.xhr({
+				url: queryUrl,
+				agent: USER_AGENT
 			});
-		});
+			const obj = JSON.parse(success.responseText);
+			const metadata = obj?.collected?.metadata;
+			if (metadata) {
+				return {
+					description: metadata.description || '',
+					version: metadata.version,
+					homepage: metadata.links?.homepage || ''
+				};
+			}
+		}
+		catch (e) {
+			//ignore
+		}
+		return undefined;
 	}
 
 	public getInfoContribution(_fileName: string, location: Location): Thenable<MarkedString[] | null> | null {
 		if ((location.matches(['dependencies', '*']) || location.matches(['devDependencies', '*']) || location.matches(['optionalDependencies', '*']) || location.matches(['peerDependencies', '*']))) {
 			const pack = location.path[location.path.length - 1];
 			if (typeof pack === 'string') {
-				return this.getInfo(pack).then(infos => {
-					if (infos.length) {
-						return [infos.map(textToMarkedString).join('\n\n')];
+				return this.fetchPackageInfo(pack).then(info => {
+					if (info) {
+						return [this.getDocumentation(info.description, info.version, info.homepage)];
 					}
 					return null;
 				});
@@ -311,7 +337,7 @@ export class PackageJSONContribution implements IJSONContribution {
 			proposal.kind = CompletionItemKind.Property;
 			proposal.insertText = insertText;
 			proposal.filterText = JSON.stringify(name);
-			proposal.documentation = pack.description || '';
+			proposal.documentation = this.getDocumentation(pack.description, pack.version, pack?.links?.homepage);
 			collector.add(proposal);
 		}
 	}
@@ -321,10 +347,11 @@ interface SearchPackageInfo {
 	name: string;
 	description?: string;
 	version?: string;
+	links?: { homepage?: string; };
 }
 
 interface ViewPackageInfo {
 	description: string;
-	distTagsLatest?: string;
+	version?: string;
 	homepage?: string;
 }

@@ -26,6 +26,9 @@ Registry.as<IWorkbenchContributionsRegistry>(Extensions.Workbench).registerWorkb
 Registry.as<IEditorInputFactoryRegistry>(Input.EditorInputFactories).registerEditorInputFactory(
 	PerfviewInput.Id,
 	class implements IEditorInputFactory {
+		canSerialize(): boolean {
+			return true;
+		}
 		serialize(): string {
 			return '';
 		}
@@ -43,7 +46,7 @@ CommandsRegistry.registerCommand('perfview.show', accessor => {
 
 MenuRegistry.addCommand({
 	id: 'perfview.show',
-	category: localize('show.cat', "Developer"),
+	category: localize({ key: 'show.cat', comment: ['A developer on Code itself or someone diagnosing issues in Code'] }, "Developer"),
 	title: localize('show.label', "Startup Performance")
 });
 
